@@ -60,7 +60,7 @@ class MarketIndex:
 class MarketOverview:
     """市场概览数据"""
     date: str                           # 日期
-    indices: List[MarketIndex] = field(default_factory=list)  # 主要指数
+    indices: List[MarketIndex] = field(default_factory=list)  # 主要指数（A股）
     up_count: int = 0                   # 上涨家数
     down_count: int = 0                 # 下跌家数
     flat_count: int = 0                 # 平盘家数
@@ -68,6 +68,10 @@ class MarketOverview:
     limit_down_count: int = 0           # 跌停家数
     total_amount: float = 0.0           # 两市成交额（亿元）
     north_flow: float = 0.0             # 北向资金净流入（亿元）
+    south_flow: float = 0.0             # 南向资金净流入（亿元，港股通）
+    
+    # 港股相关：恒生科技等指数
+    hk_indices: List[MarketIndex] = field(default_factory=list)
     
     # 板块涨幅榜
     top_sectors: List[Dict] = field(default_factory=list)     # 涨幅前5板块
@@ -86,7 +90,7 @@ class MarketAnalyzer:
     5. 生成大盘复盘报告
     """
     
-    # 主要指数代码
+    # 主要指数代码（A股）
     MAIN_INDICES = {
         '000001': '上证指数',
         '399001': '深证成指',
@@ -94,6 +98,12 @@ class MarketAnalyzer:
         '000688': '科创50',
         '000016': '上证50',
         '000300': '沪深300',
+    }
+    # 港股主要指数（东财代码，用于恒生科技等大盘分析）
+    HK_INDICES = {
+        '124852': '恒生科技',   # 东财港股指数代码
+        '100': '恒生指数',
+        '124850': '恒生国企',
     }
     
     def __init__(self, search_service: Optional[SearchService] = None, analyzer=None):
@@ -129,6 +139,10 @@ class MarketAnalyzer:
         
         # 4. 获取北向资金（可选）
         self._get_north_flow(overview)
+        
+        # 5. 南向资金 + 港股指数（恒生科技等）
+        self._get_south_flow(overview)
+        self._get_hk_indices(overview)
         
         return overview
     
@@ -266,6 +280,61 @@ class MarketAnalyzer:
         except Exception as e:
             logger.warning(f"[大盘] 获取北向资金失败: {e}")
     
+    def _get_south_flow(self, overview: MarketOverview):
+        """获取南向资金净流入（港股通）"""
+        try:
+            logger.info("[大盘] 获取南向资金...")
+            df = ak.stock_hsgt_north_net_flow_in_em(symbol="南下")
+            if df is not None and not df.empty:
+                latest = df.iloc[-1]
+                if '当日净流入' in df.columns:
+                    overview.south_flow = float(latest['当日净流入']) / 1e8
+                elif '净流入' in df.columns:
+                    overview.south_flow = float(latest['净流入']) / 1e8
+                logger.info(f"[大盘] 南向资金净流入: {overview.south_flow:.2f}亿")
+        except Exception as e:
+            logger.warning(f"[大盘] 获取南向资金失败: {e}")
+    
+    def _get_hk_indices(self, overview: MarketOverview):
+        """获取港股主要指数（恒生科技、恒生指数等）"""
+        try:
+            func = getattr(ak, 'stock_hk_index_spot_em', None)
+            if func is None:
+                logger.debug("[大盘] akshare 无 stock_hk_index_spot_em，跳过港股指数")
+                return
+            logger.info("[大盘] 获取港股指数（恒生科技等）...")
+            df = func()
+            if df is None or df.empty:
+                return
+            code_col = '代码' if '代码' in df.columns else df.columns[0]
+            name_col = '名称' if '名称' in df.columns else (df.columns[1] if len(df.columns) > 1 else None)
+            for code, name in self.HK_INDICES.items():
+                row = df[df[code_col].astype(str).str.strip() == str(code).strip()]
+                if row.empty:
+                    if name_col:
+                        row = df[df[name_col].astype(str).str.contains(name, na=False)]
+                if not row.empty:
+                    row = row.iloc[0]
+                    def _f(k, d=0.0):
+                        try:
+                            v = row.get(k, d)
+                            return float(v) if v is not None and str(v).replace('.','').replace('-','').isdigit() else d
+                        except Exception:
+                            return d
+                    overview.hk_indices.append(MarketIndex(
+                        code=str(code),
+                        name=name,
+                        current=_f('最新价', _f('现价')),
+                        change=_f('涨跌额', _f('涨跌')),
+                        change_pct=_f('涨跌幅', _f('涨幅')),
+                        open=_f('今开'), high=_f('最高'), low=_f('最低'), prev_close=_f('昨收'),
+                        volume=_f('成交量'), amount=_f('成交额'), amplitude=_f('振幅'),
+                    ))
+            if overview.hk_indices:
+                logger.info(f"[大盘] 港股指数: {[f'{i.name}{i.change_pct:+.2f}%' for i in overview.hk_indices]}")
+        except Exception as e:
+            logger.warning(f"[大盘] 获取港股指数失败: {e}")
+    
     def search_market_news(self) -> List[Dict]:
         """
         搜索市场新闻
@@ -281,11 +350,12 @@ class MarketAnalyzer:
         today = datetime.now()
         month_str = f"{today.year}年{today.month}月"
         
-        # 多维度搜索
+        # 多维度搜索（含港股/恒生科技/南向资金）
         search_queries = [
             f"A股 大盘 复盘 {month_str}",
             f"股市 行情 分析 今日 {month_str}",
             f"A股 市场 热点 板块 {month_str}",
+            f"港股 恒生科技 南向资金 {month_str}",
         ]
         
         try:
@@ -366,6 +436,13 @@ class MarketAnalyzer:
         for idx in overview.indices:
             direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
             indices_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+        # 港股指数（恒生科技等）
+        hk_text = ""
+        for idx in overview.hk_indices:
+            direction = "↑" if idx.change_pct > 0 else "↓" if idx.change_pct < 0 else "-"
+            hk_text += f"- {idx.name}: {idx.current:.2f} ({direction}{abs(idx.change_pct):.2f}%)\n"
+        if not hk_text:
+            hk_text = "（暂无港股指数数据）\n"
         
         # 板块信息
         top_sectors_text = ", ".join([f"{s['name']}({s['change_pct']:+.2f}%)" for s in overview.top_sectors[:3]])
@@ -383,7 +460,7 @@ class MarketAnalyzer:
                 snippet = n.get('snippet', '')[:100]
             news_text += f"{i}. {title}\n   {snippet}\n"
         
-        prompt = f"""你是一位专业的A股市场分析师，请根据以下数据生成一份简洁的大盘复盘报告。
+        prompt = f"""你是一位专业的A股与港股市场分析师，请根据以下数据生成一份简洁的大盘复盘报告（涵盖A股与港股/恒生科技、北向与南向资金）。
 
 【重要】输出要求：
 - 必须输出纯 Markdown 文本格式
@@ -406,6 +483,10 @@ class MarketAnalyzer:
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元
 - 北向资金: {overview.north_flow:+.2f} 亿元
+- 南向资金（港股通）: {overview.south_flow:+.2f} 亿元
+
+## 港股指数（恒生科技等）
+{hk_text}
 
 ## 板块表现
 领涨: {top_sectors_text}
@@ -424,10 +505,10 @@ class MarketAnalyzer:
 （2-3句话概括今日市场整体表现，包括指数涨跌、成交量变化）
 
 ### 二、指数点评
-（分析上证、深证、创业板等各指数走势特点）
+（分析上证、深证、创业板等A股指数，以及恒生科技等港股指数走势）
 
 ### 三、资金动向
-（解读成交额和北向资金流向的含义）
+（解读成交额、北向资金、南向资金（港股通）流向的含义）
 
 ### 四、热点解读
 （分析领涨领跌板块背后的逻辑和驱动因素）
@@ -488,6 +569,7 @@ class MarketAnalyzer:
 | 跌停 | {overview.limit_down_count} |
 | 两市成交额 | {overview.total_amount:.0f}亿 |
 | 北向资金 | {overview.north_flow:+.2f}亿 |
+| 南向资金 | {overview.south_flow:+.2f}亿 |
 
 ### 四、板块表现
 - **领涨**: {top_text}

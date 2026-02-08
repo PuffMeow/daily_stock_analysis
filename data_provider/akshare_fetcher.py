@@ -265,6 +265,19 @@ class AkshareFetcher(BaseFetcher):
         """
         return code.startswith(('51', '56', '58', '15', '16', '18'))
 
+    @staticmethod
+    def is_hk(code: str) -> bool:
+        """
+        判断是否为港股代码
+        
+        约定：5 位数字为港股（如 00700、09988），A 股为 6 位。
+        若带 .HK 后缀则去掉后判断数字部分长度。
+        """
+        c = code.strip().upper().replace('.HK', '').replace('.hk', '')
+        if not c.isdigit():
+            return False
+        return len(c) == 5 or (len(c) == 4 and c.startswith('0'))
+
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
         wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
@@ -289,8 +302,12 @@ class AkshareFetcher(BaseFetcher):
         self._enforce_rate_limit()
         
         is_etf_code = self.is_etf(stock_code)
+        is_hk_code = self.is_hk(stock_code)
         
-        if is_etf_code:
+        if is_hk_code:
+            api_name = "ak.stock_hk_hist"
+            logger.info(f"[API调用] {api_name}(symbol={stock_code}, ...) 港股")
+        elif is_etf_code:
             api_name = "ak.fund_etf_hist_em"
             logger.info(f"[API调用] {api_name}(symbol={stock_code}, ...)")
         else:
@@ -300,7 +317,16 @@ class AkshareFetcher(BaseFetcher):
         try:
             api_start = _time.time()
             
-            if is_etf_code:
+            if is_hk_code:
+                # 港股日线（AKShare 港股代码 5 位如 00700）
+                df = ak.stock_hk_hist(
+                    symbol=stock_code,
+                    period="daily",
+                    start_date=start_date.replace('-', ''),
+                    end_date=end_date.replace('-', ''),
+                    adjust="qfq"
+                )
+            elif is_etf_code:
                 # 获取 ETF 历史数据
                 df = ak.fund_etf_hist_em(
                     symbol=stock_code,
@@ -344,11 +370,11 @@ class AkshareFetcher(BaseFetcher):
         """
         标准化 Akshare 数据
         
-        兼容股票和 ETF 的列名
+        兼容 A 股、港股、ETF 的列名
         """
         df = df.copy()
         
-        # 列名映射
+        # 列名映射（A股/ETF/港股通用）
         column_mapping = {
             '日期': 'date',
             '开盘': 'open',
@@ -359,6 +385,11 @@ class AkshareFetcher(BaseFetcher):
             '成交额': 'amount',
             '涨跌幅': 'pct_chg',
         }
+        # 港股部分接口可能用英文或略不同列名
+        column_mapping.update({
+            '开盘价': 'open', '收盘价': 'close', '最高价': 'high', '最低价': 'low',
+            '成交额': 'amount', '成交量': 'volume',
+        })
         
         # 重命名列
         df = df.rename(columns=column_mapping)
@@ -385,27 +416,16 @@ class AkshareFetcher(BaseFetcher):
         """
         获取实时行情数据
         
-        自动区分股票和 ETF：
-        - 股票: ak.stock_zh_a_spot_em
+        自动区分 A 股、港股、ETF：
+        - A股: ak.stock_zh_a_spot_em
+        - 港股: ak.stock_hk_spot_em
         - ETF: ak.fund_etf_spot_em
         """
         import akshare as ak
         
         try:
             is_etf_code = self.is_etf(stock_code)
-            
-            # 使用不同的缓存 key
-            cache_key = 'etf' if is_etf_code else 'stock'
-            
-            # 初始化多类型缓存结构 (如果需要)
-            # 这里简单起见，如果类型切换了，就清除缓存重新获取
-            # 或者我们假设一次运行只查一种 或 接受混用时的即时刷新
-            # 更好的做法是 _realtime_cache 存储 { 'stock': ..., 'etf': ... }
-            # 但为了最小化改动，简单处理：
-            
-            # 这里我们分别获取，不依赖全局单一缓存，
-            # 而是检查 _realtime_cache 内容是否包含当前代码类型
-            # 实际上 stock_zh_a_spot_em 和 fund_etf_spot_em 返回结构类似
+            is_hk_code = self.is_hk(stock_code)
             
             # 防封禁策略
             self._set_random_user_agent()
@@ -414,7 +434,10 @@ class AkshareFetcher(BaseFetcher):
             import time as _time
             api_start = _time.time()
             
-            if is_etf_code:
+            if is_hk_code:
+                logger.info(f"[API调用] ak.stock_hk_spot_em() 获取港股实时行情...")
+                df = ak.stock_hk_spot_em()
+            elif is_etf_code:
                 logger.info(f"[API调用] ak.fund_etf_spot_em() 获取ETF实时行情...")
                 df = ak.fund_etf_spot_em()
             else:
@@ -424,9 +447,12 @@ class AkshareFetcher(BaseFetcher):
             api_elapsed = _time.time() - api_start
             logger.info(f"[API返回] 成功: 返回 {len(df)} 条数据, 耗时 {api_elapsed:.2f}s")
              
-            # 查找指定代码
-            # 注意：ETF 接口返回的列名可能略有不同，需适配
-            row = df[df['代码'] == stock_code]
+            # 查找指定代码（港股/东财代码列可能为 5 位或带前缀，统一用字符串匹配）
+            code_col = '代码' if '代码' in df.columns else df.columns[0]
+            row = df[df[code_col].astype(str).str.strip() == str(stock_code).strip()]
+            if row.empty and is_hk_code:
+                # 尝试去掉前导零匹配（如 700 vs 00700）
+                row = df[df[code_col].astype(str).str.lstrip('0') == str(stock_code).lstrip('0')]
             if row.empty:
                 logger.warning(f"[API返回] 未找到 {stock_code} 的实时行情")
                 return None
@@ -472,10 +498,14 @@ class AkshareFetcher(BaseFetcher):
         """
         获取筹码分布数据
         
-        注意：ETF 通常没有筹码分布数据，直接返回 None
+        注意：ETF、港股 暂无筹码分布接口，直接返回 None
+        （东财 A 股个股才有 stock_cyq_em）
         """
         if self.is_etf(stock_code):
             logger.info(f"[{stock_code}] ETF 不支持筹码分布分析，跳过")
+            return None
+        if self.is_hk(stock_code):
+            logger.info(f"[{stock_code}] 港股暂不支持筹码分布，跳过")
             return None
             
         import akshare as ak

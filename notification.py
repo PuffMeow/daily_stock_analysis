@@ -67,8 +67,11 @@ class NotificationService:
             report_date = datetime.now().strftime('%Y-%m-%d')
         
         # 标题
+        # 标题：若结果中含港股则体现 A股/港股
+        has_hk = any(getattr(r, 'is_hk', False) or (len(getattr(r, 'code', '') or '') == 5 and (getattr(r, 'code', '') or '').isdigit()) for r in results)
+        title = f"# 📅 {report_date} A股/港股自选股智能分析报告" if has_hk else f"# 📅 {report_date} A股自选股智能分析报告"
         report_lines = [
-            f"# 📅 {report_date} A股自选股智能分析报告",
+            title,
             "",
             f"> 共分析 **{len(results)}** 只股票 | 报告生成时间：{datetime.now().strftime('%H:%M:%S')}",
             "",

@@ -515,6 +515,10 @@ class SearchService:
         results = {}
         search_count = 0
         
+        # 是否港股（5位代码或带 .HK）
+        code_stripped = str(stock_code).strip().upper().replace(".HK", "").replace(".hk", "")
+        is_hk = (len(code_stripped) == 5 and code_stripped.isdigit()) or (len(code_stripped) == 4 and code_stripped.isdigit() and code_stripped.startswith("0"))
+        
         # 定义搜索维度
         search_dimensions = [
             {
@@ -523,7 +527,7 @@ class SearchService:
                 'desc': '最新消息'
             },
             {
-                'name': 'risk_check', 
+                'name': 'risk_check',
                 'query': f"{stock_name} 减持 处罚 利空 风险",
                 'desc': '风险排查'
             },
@@ -533,8 +537,14 @@ class SearchService:
                 'desc': '业绩预期'
             },
         ]
+        if is_hk:
+            search_dimensions.append({
+                'name': 'hk_southbound',
+                'query': f"{stock_name} 港股 南向资金 资金流向",
+                'desc': '港股与南向资金'
+            })
         
-        logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})")
+        logger.info(f"开始多维度情报搜索: {stock_name}({stock_code})" + (" [港股]" if is_hk else ""))
         
         # 轮流使用不同的搜索引擎
         provider_index = 0
@@ -613,6 +623,17 @@ class SearchService:
                     lines.append(f"     {r.snippet[:100]}...")
             else:
                 lines.append("  未找到业绩相关信息")
+        
+        # 港股/南向资金（仅港股标的时有）
+        if 'hk_southbound' in intel_results:
+            resp = intel_results['hk_southbound']
+            lines.append(f"\n🇭🇰 港股与南向资金 (来源: {resp.provider}):")
+            if resp.success and resp.results:
+                for i, r in enumerate(resp.results[:3], 1):
+                    lines.append(f"  {i}. {r.title}")
+                    lines.append(f"     {r.snippet[:100]}...")
+            else:
+                lines.append("  未找到港股/南向资金相关情报")
         
         return "\n".join(lines)
     
