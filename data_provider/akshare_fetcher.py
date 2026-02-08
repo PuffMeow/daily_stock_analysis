@@ -31,10 +31,29 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
+    retry_if_exception,
     before_sleep_log,
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS
+
+
+def _should_retry_connection(e: BaseException) -> bool:
+    """是否应对连接类错误重试（含 Remote end closed / RemoteDisconnected）"""
+    if isinstance(e, (ConnectionError, TimeoutError)):
+        return True
+    msg = str(e).lower()
+    keywords = (
+        "remote end closed",
+        "remotedisconnected",
+        "connection aborted",
+        "chunkedencoding",
+        "connection reset",
+        "connection closed",
+        "remote disconnected",
+        "without response",
+    )
+    return any(k in msg for k in keywords)
 
 
 @dataclass
@@ -279,9 +298,9 @@ class AkshareFetcher(BaseFetcher):
         return len(c) == 5 or (len(c) == 4 and c.startswith('0'))
 
     @retry(
-        stop=stop_after_attempt(3),  # 最多重试3次
-        wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
-        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        stop=stop_after_attempt(4),  # 港股易被关连接，多试一次
+        wait=wait_exponential(multiplier=2, min=3, max=60),  # 退避更缓：3, 6, 12... 最大60秒
+        retry=retry_if_exception(_should_retry_connection),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -304,6 +323,12 @@ class AkshareFetcher(BaseFetcher):
         is_etf_code = self.is_etf(stock_code)
         is_hk_code = self.is_hk(stock_code)
         
+        # 港股接口易被东财关闭连接，请求前多等几秒
+        if is_hk_code:
+            extra = random.uniform(3, 6)
+            logger.debug(f"[港股] 额外休眠 {extra:.1f}s 降低连接被关概率")
+            time.sleep(extra)
+        
         if is_hk_code:
             api_name = "ak.stock_hk_hist"
             logger.info(f"[API调用] {api_name}(symbol={stock_code}, ...) 港股")
@@ -318,14 +343,21 @@ class AkshareFetcher(BaseFetcher):
             api_start = _time.time()
             
             if is_hk_code:
-                # 港股日线（AKShare 港股代码 5 位如 00700）
-                df = ak.stock_hk_hist(
-                    symbol=stock_code,
-                    period="daily",
-                    start_date=start_date.replace('-', ''),
-                    end_date=end_date.replace('-', ''),
-                    adjust="qfq"
-                )
+                # 港股日线（AKShare 港股代码 5 位如 00700）；大 timeout 降低连接被关概率
+                kwargs = {
+                    "symbol": stock_code,
+                    "period": "daily",
+                    "start_date": start_date.replace('-', ''),
+                    "end_date": end_date.replace('-', ''),
+                    "adjust": "qfq",
+                }
+                try:
+                    import inspect
+                    if "timeout" in inspect.signature(ak.stock_hk_hist).parameters:
+                        kwargs["timeout"] = 30
+                except Exception:
+                    pass
+                df = ak.stock_hk_hist(**kwargs)
             elif is_etf_code:
                 # 获取 ETF 历史数据
                 df = ak.fund_etf_hist_em(
@@ -430,13 +462,30 @@ class AkshareFetcher(BaseFetcher):
             # 防封禁策略
             self._set_random_user_agent()
             self._enforce_rate_limit()
+            if is_hk_code:
+                extra = random.uniform(3, 6)
+                logger.debug(f"[港股实时] 额外休眠 {extra:.1f}s")
+                time.sleep(extra)
             
             import time as _time
             api_start = _time.time()
             
             if is_hk_code:
                 logger.info(f"[API调用] ak.stock_hk_spot_em() 获取港股实时行情...")
-                df = ak.stock_hk_spot_em()
+                df = None
+                try:
+                    import inspect
+                    if "timeout" in inspect.signature(ak.stock_hk_spot_em).parameters:
+                        df = ak.stock_hk_spot_em(timeout=30)
+                    else:
+                        df = ak.stock_hk_spot_em()
+                except Exception as spot_e:
+                    if _should_retry_connection(spot_e):
+                        logger.warning(f"[港股实时] 首次请求失败({spot_e})，5s 后重试一次")
+                        time.sleep(5)
+                        df = ak.stock_hk_spot_em()
+                    else:
+                        raise
             elif is_etf_code:
                 logger.info(f"[API调用] ak.fund_etf_spot_em() 获取ETF实时行情...")
                 df = ak.fund_etf_spot_em()
